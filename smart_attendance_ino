@@ -1,0 +1,369 @@
+/*
+ * Smart Attendance System
+ * ESP32 + MFRC522 RFID + DS1302 RTC (Rtc by Makuna) + 16x2 I2C LCD
+ * + Buzzer + 3 Tactile Buttons + Google Sheets Logging
+ *
+ * Features:
+ * - Register RFID cards with user names via buttons
+ * - LCD shows only Name, Date, Time (no welcome messages)
+ * - Idle screen shows "LEETA"
+ * - Success / Error buzzer tones
+ * - Attendance logged to Google Sheets
+ */
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <LiquidCrystal_I2C.h>
+#include <ThreeWire.h>
+#include <RtcDS1302.h>
+#include <LittleFS.h>
+#include <time.h>
+
+// ==================== PIN DEFINITIONS ====================
+#define RFID_SS_PIN   5
+#define RFID_RST_PIN  17
+#define BUZZER_PIN    32
+#define MODE_BTN      33
+#define UP_BTN        34
+#define DOWN_BTN      35
+#define RTC_CLK       25
+#define RTC_DAT       26
+#define RTC_RST       27
+
+// ==================== USER CONFIG ========================
+const char* ssid              = "YOUR_WIFI_SSID";
+const char* password          = "YOUR_WIFI_PASSWORD";
+const char* GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec";
+
+// Timezone offset in seconds (e.g. WAT = +1 hour = 3600)
+const long  timezoneOffset    = 3600;
+const int   idleTimeout       = 10000;   // 10 seconds
+
+// ==================== OBJECTS ============================
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+LiquidCrystal_I2C lcd(0x27, 16, 2);   // Change 0x27 if your LCD address is different
+ThreeWire myWire(RTC_DAT, RTC_CLK, RTC_RST);
+RtcDS1302<ThreeWire> rtc(myWire);
+
+// ==================== GLOBAL VARIABLES ===================
+String usersFile = "/users.txt";
+unsigned long lastActivity = 0;
+bool regMode = false;
+String currentName = "";
+char currentChar = 'A';
+
+// ==================== SETUP ==============================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  SPI.begin();
+  rfid.PCD_Init();
+
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(MODE_BTN, INPUT_PULLUP);
+  pinMode(UP_BTN, INPUT_PULLUP);
+  pinMode(DOWN_BTN, INPUT_PULLUP);
+
+  rtc.Begin();
+
+  if (!LittleFS.begin(true)) {          // true = format if mount fails
+    Serial.println("LittleFS mount failed");
+    showOnLCD("FS Error", "Check Flash");
+    while (true) delay(1000);
+  }
+
+  if (!LittleFS.exists(usersFile)) {
+    File f = LittleFS.open(usersFile, "w");
+    if (f) f.close();
+  }
+
+  connectWiFi();
+  syncRTCFromNTP();
+
+  showIdle();
+  lastActivity = millis();
+  Serial.println("System Ready");
+}
+
+// ==================== MAIN LOOP ==========================
+void loop() {
+  checkButtons();
+
+  if (regMode) {
+    handleRegistration();
+  } else {
+    checkRFID();
+  }
+
+  if (millis() - lastActivity > idleTimeout) {
+    showIdle();
+  }
+}
+
+// ==================== WIFI ===============================
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi Failed - offline mode");
+  }
+}
+
+// ==================== RTC + NTP ==========================
+void syncRTCFromNTP() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  configTime(timezoneOffset, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+
+  if (getLocalTime(&timeinfo, 5000)) {
+    RtcDateTime now(
+      timeinfo.tm_year + 1900,
+      timeinfo.tm_mon + 1,
+      timeinfo.tm_mday,
+      timeinfo.tm_hour,
+      timeinfo.tm_min,
+      timeinfo.tm_sec
+    );
+    rtc.SetDateTime(now);
+    Serial.println("RTC synced from NTP");
+  } else {
+    Serial.println("NTP sync failed - using RTC battery time");
+  }
+}
+
+// ==================== BUTTONS ============================
+void checkButtons() {
+  static unsigned long lastDebounce = 0;
+  if (digitalRead(MODE_BTN) == LOW && millis() - lastDebounce > 300) {
+    lastDebounce = millis();
+    regMode = !regMode;
+    lastActivity = millis();
+
+    if (regMode) {
+      showOnLCD("Reg Mode:", "Scan Card");
+      currentName = "";
+      currentChar = 'A';
+    } else {
+      showOnLCD("Normal Mode", "");
+      delay(800);
+    }
+  }
+}
+
+// ==================== REGISTRATION =======================
+void handleRegistration() {
+  String uid = getRFID_UID();
+  if (uid == "") return;
+
+  lastActivity = millis();
+  currentName = "";
+  currentChar = 'A';
+  showOnLCD("Enter Name:", String(currentChar) + "_");
+
+  while (regMode) {
+    lastActivity = millis();
+
+    // UP button - next character
+    if (digitalRead(UP_BTN) == LOW) {
+      delay(180);
+      currentChar++;
+      if (currentChar == '[') currentChar = '0';      // after Z → 0
+      if (currentChar == ':') currentChar = ' ';  // after 9 → space
+      if (currentChar == '!') currentChar = 'A';  // after space → A
+      showOnLCD("Enter Name:", currentName + currentChar + "_");
+    }
+
+    // DOWN button - previous character
+    if (digitalRead(DOWN_BTN) == LOW) {
+      delay(180);
+      currentChar--;
+      if (currentChar == '@') currentChar = ' ';  // before A → space
+      if (currentChar == 31)  currentChar = '9';  // before space → 9
+      if (currentChar == '/') currentChar = 'Z';  // before 0 → Z
+      showOnLCD("Enter Name:", currentName + currentChar + "_");
+    }
+
+    // MODE button - confirm character or finish
+    if (digitalRead(MODE_BTN) == LOW) {
+      delay(250);
+      if (currentChar == ' ' || currentName.length() >= 14) {
+        // Finish registration
+        if (currentName.length() == 0) currentName = "User";
+        String entry = uid + "," + currentName + "\n";
+        appendFile(usersFile, entry.c_str());
+        showOnLCD("Saved:", currentName);
+        successBeep();
+        delay(1500);
+        regMode = false;
+        showIdle();
+        return;
+      } else {
+        currentName += currentChar;
+        currentChar = 'A';
+        showOnLCD("Enter Name:", currentName + currentChar + "_");
+      }
+    }
+  }
+}
+
+// ==================== RFID CHECK =========================
+void checkRFID() {
+  String uid = getRFID_UID();
+  if (uid == "") return;
+
+  lastActivity = millis();
+  String name = getNameFromUID(uid);
+
+  RtcDateTime now = rtc.GetDateTime();
+  char dateBuf[11];
+  char timeBuf[6];
+  sprintf(dateBuf, "%02u/%02u/%02u", now.Day(), now.Month(), now.Year() % 100);
+  sprintf(timeBuf, "%02u:%02u", now.Hour(), now.Minute());
+
+  if (name != "") {
+    // Truncate name if too long for 16 chars
+    String line1 = name;
+    if (line1.length() > 16) line1 = line1.substring(0, 16);
+    String line2 = String(dateBuf) + " " + String(timeBuf);
+    showOnLCD(line1, line2);
+    successBeep();
+    sendToGoogleSheets(name, dateBuf, timeBuf);
+  } else {
+    showOnLCD("Unknown Card", "");
+    errorBeep();
+  }
+
+  delay(2500);   // Show result for 2.5 seconds
+}
+
+// ==================== HELPERS ============================
+String getRFID_UID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+    return "";
+  }
+
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  return uid;
+}
+
+String getNameFromUID(String uid) {
+  File file = LittleFS.open(usersFile, "r");
+  if (!file) return "";
+
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    int comma = line.indexOf(',');
+    if (comma > 0 && line.substring(0, comma) == uid) {
+      file.close();
+      return line.substring(comma + 1);
+    }
+  }
+  file.close();
+  return "";
+}
+
+void sendToGoogleSheets(String name, String date, String time) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No WiFi - cannot log to Sheets");
+    return;
+  }
+
+  HTTPClient http;
+  String url = String(GOOGLE_SCRIPT_URL) +
+               "?name=" + urlEncode(name) +
+               "&date=" + urlEncode(date) +
+               "&time=" + urlEncode(time);
+
+  http.begin(url);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+    Serial.printf("Sheets response: %d\n", httpCode);
+  } else {
+    Serial.printf("Sheets error: %s\n", http.errorToString(httpCode).c_str());
+  }
+  http.end();
+}
+
+// Simple URL encode for names with spaces
+String urlEncode(String str) {
+  String encoded = "";
+  char c;
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (c == ' ') encoded += "%20";
+    else if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') encoded += c;
+    else {
+      char buf[4];
+      sprintf(buf, "%%%02X", c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}
+
+void successBeep() {
+  tone(BUZZER_PIN, 1200, 150);
+  delay(180);
+  tone(BUZZER_PIN, 1500, 150);
+}
+
+void errorBeep() {
+  tone(BUZZER_PIN, 400, 400);
+  delay(450);
+  tone(BUZZER_PIN, 300, 400);
+}
+
+void showOnLCD(String line1, String line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1.substring(0, 16));
+  lcd.setCursor(0, 1);
+  lcd.print(line2.substring(0, 16));
+}
+
+void showIdle() {
+  lcd.clear();
+  // Center "LEETA" on the first line (16 chars → start at position 5)
+  lcd.setCursor(5, 0);
+  lcd.print("LEETA");
+}
+
+void appendFile(String path, const char* message) {
+  File file = LittleFS.open(path, "a");
+  if (file) {
+    file.print(message);
+    file.close();
+    Serial.println("User saved");
+  } else {
+    Serial.println("Failed to append");
+  }
+}
